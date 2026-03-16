@@ -1,0 +1,83 @@
+{
+    "name": "miguelenred/jsonsqldb",
+    "description": "SQL database engine, HTTP API and web admin panel in plain PHP over JSON files. No database server, no external dependencies.",
+    "type": "library",
+    "keywords": [
+        "database",
+        "sql",
+        "json",
+        "sql-engine",
+        "no-dependencies",
+        "shared-hosting",
+        "admin-panel"
+    ],
+    "homepage": "https://github.com/miguelenred/jsonsqldb",
+    "license": "Apache-2.0",
+    "authors": [
+        {
+            "name": "Miguel Sanchez",
+            "email": "miguel@miguelenred.es",
+            "homepage": "https://github.com/miguelenred",
+            "role": "Author, design and technical direction"
+        },
+        {
+            "name": "AI-assisted implementation",
+            "role": "Source code, tests and documentation produced with the assistance of several AI models, under the author's direction and review"
+        }
+    ],
+    "support": {
+        "issues": "https://github.com/miguelenred/jsonsqldb/issues",
+        "source": "https://github.com/miguelenred/jsonsqldb",
+        "docs": "https://github.com/miguelenred/jsonsqldb/tree/main/docs"
+    },
+    "require": {
+        "php": ">=8.0"
+    },
+    "suggest": {
+        "ext-curl": "Optional for jsonSQLDBadmin, which otherwise calls the API with PHP's stream functions",
+        "ext-zip": "Only for the admin panel's ZIP backup and restore and its Excel files",
+        "ext-apcu": "Optional shared cache; without it the engine caches on disk"
+    },
+    "autoload": {
+        "psr-4": {
+            "JsonSQLDB\\": "engine/"
+        }
+    },
+    "scripts": {
+        "test": [
+            "php tests/f1_nucleo.php",
+            "php tests/f2_parser.php",
+            "php tests/f2_select.php",
+            "php tests/f3_escrituras.php",
+            "php tests/f4_api.php",
+            "php tests/f5_esquema.php",
+            "php tests/f5_admin.php",
+            "php tests/f6_cortes.php",
+            "php tests/f7_concurrencia.php",
+            "php tests/f8_indices.php",
+            "php tests/f9_journal.php",
+            "php tests/f10_indices_incrementales.php",
+            "php tests/f11_asistente.php",
+            "php tests/f12_contra_sqlite.php",
+            "php tests/f13_fuzz_contra_sqlite.php",
+            "php tests/f14_volcados.php",
+            "php tests/f15_idiomas.php",
+            "php tests/f16_vistas_triggers.php",
+            "php tests/f17_rutinas_importadas.php",
+            "php tests/f18_access.php",
+            "php tests/f19_escrituras_contra_sqlite.php",
+            "php tests/f20_memoria.php",
+            "php tests/f21_compatibilidad.php",
+            "php tests/f22_sqlserver.php",
+            "php tests/f23_reparar.php",
+            "php tests/f24_versiones_anteriores.php",
+            "php tests/f25_ficheros_abiertos.php"
+        ]
+    },
+    "scripts-descriptions": {
+        "test": "Runs the 27 test suites; the ones that need MySQL, PostgreSQL, PowerShell or the git tags skip what they cannot check. Run php configurar.php --local first."
+    },
+    "config": {
+        "sort-packages": true
+    }
+}
