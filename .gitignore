@@ -1,0 +1,50 @@
+# Real configuration files - copy the .dist templates and fill these in
+/api/jsonsqldb_api_config.php
+/jsonsqldbadmin/config.php
+
+# Runtime data: databases, logs, panel users and audit trail
+/data/*
+!/data/.htaccess
+!/data/web.config
+!/data/.gitkeep
+
+/logs/*
+!/logs/.htaccess
+!/logs/web.config
+!/logs/.gitkeep
+
+/jsonsqldbadmin/datos/*
+!/jsonsqldbadmin/datos/.htaccess
+!/jsonsqldbadmin/datos/web.config
+!/jsonsqldbadmin/datos/.gitkeep
+
+# Composer: the lock file is not committed because there are no dependencies
+# to lock, and vendor/ is generated
+/vendor/
+/composer.lock
+
+# Certificates and keys
+*.crt
+*.pem
+*.key
+*.pfx
+
+# Editors and operating systems
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
+*.swp
+
+# Static analysis: config and cache, if you run it locally
+/phpstan.neon
+/phpstan-bootstrap.php
+/.phpstan-cache/
+
+# Temporary files
+*.tmp
+*.bak
+
+# Python: bytecode cache, if a client is imported as a module
+__pycache__/
