@@ -1,0 +1,193 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Mínimo imprescindible: el workflow solo lee el código y ejecuta pruebas.
+# Sin esto, el GITHUB_TOKEN hereda los permisos del repositorio, que en
+# repositorios antiguos son de escritura.
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.0', '8.1', '8.2', '8.3', '8.4', '8.5']
+
+    name: PHP ${{ matrix.php }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # the tags of every version, for f24
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, zip, sqlite3, mysqli, pgsql, apcu
+          coverage: none
+
+      - name: Create configuration
+        # configurar.php genera claves al azar y las hace coincidir entre panel
+        # y API. Copiar los .dist a secas dejaba las claves de ejemplo, que están
+        # publicadas en el repositorio y ahora impiden arrancar a propósito.
+        run: php configurar.php --local
+
+      - name: A locale with a decimal comma
+        # f21 comprueba que un decimal pasado a texto no depende del locale
+        # de la aplicación; sin uno de coma, esa prueba se salta
+        run: sudo locale-gen es_ES.UTF-8
+
+      - name: Lint every PHP file
+        run: find . -name '*.php' -print0 | xargs -0 -n1 php -l
+
+      - name: Engine and API
+        run: |
+          php tests/f1_nucleo.php
+          php tests/f2_parser.php
+          php tests/f2_select.php
+          php tests/f3_escrituras.php
+          php tests/f4_api.php
+          php tests/f5_esquema.php
+
+      - name: Admin panel
+        run: php tests/f5_admin.php
+
+      - name: Admin panel setup wizard and direct connection
+        run: php tests/f11_asistente.php
+
+      - name: Export and import larger than PHP memory, scheduled backups (API and direct connection)
+        run: |
+          php tests/f20_memoria.php
+          php tests/f20_memoria.php --directa
+
+      - name: Panel in pure PHP (mbstring and cURL disabled)
+        run: php tests/f5_admin.php --php-puro
+
+      - name: Panel on a hosting with open_basedir (no system temp folder, PHP warnings shown)
+        run: |
+          php tests/f5_admin.php --open-basedir
+          php tests/f20_memoria.php --open-basedir
+          php tests/f20_memoria.php --directa --open-basedir
+
+      - name: No runtime data in the repository
+        run: |
+          sobra=$(git ls-files data logs jsonsqldbadmin/datos | grep -vE '(\.htaccess|web\.config|\.gitkeep)$' || true)
+          if [ -n "$sobra" ]; then echo "Runtime files tracked: $sobra"; exit 1; fi
+
+      - name: Same results as SQLite
+        run: php tests/f12_contra_sqlite.php
+
+      - name: SQLite and MySQL compatibility
+        run: php tests/f21_compatibilidad.php
+
+      - name: Panel translations
+        run: php tests/f15_idiomas.php
+
+      - name: Dumps to and from SQLite, MySQL, PostgreSQL and SQL Server
+        run: |
+          sudo systemctl start mysql.service
+          sudo systemctl start postgresql.service
+          sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';"
+          php tests/f14_volcados.php
+          php tests/f16_vistas_triggers.php
+          php tests/f17_rutinas_importadas.php
+          JSONSQLDB_TEST_PWSH_EXIGIR=1 php tests/f18_access.php
+          JSONSQLDB_TEST_PWSH_EXIGIR=1 php tests/f22_sqlserver.php
+        env:
+          JSONSQLDB_TEST_MYSQL: 127.0.0.1:root:root
+          JSONSQLDB_TEST_MYSQL_EXIGIR: 1
+          JSONSQLDB_TEST_POSTGRESQL: 127.0.0.1:postgres:postgres
+          JSONSQLDB_TEST_POSTGRESQL_EXIGIR: 1
+          JSONSQLDB_TEST_NORTHWIND: 1
+
+      - name: Random queries and writes against SQLite (fixed seeds, with and without indexes)
+        run: |
+          php tests/f13_fuzz_contra_sqlite.php --semilla=20260930 --n=3000
+          php tests/f13_fuzz_contra_sqlite.php --semilla=20260930 --n=3000 --sin-indices
+          php tests/f19_escrituras_contra_sqlite.php
+
+      - name: Crash recovery
+        run: php tests/f6_cortes.php
+
+      - name: Concurrency
+        run: php tests/f7_concurrencia.php
+
+      - name: Files held open by another process while they are replaced
+        run: php tests/f25_ficheros_abiertos.php
+
+      - name: Indexes
+        run: php tests/f8_indices.php
+
+      - name: Journal
+        run: php tests/f9_journal.php
+
+      - name: Incremental indexes
+        run: php tests/f10_indices_incrementales.php
+
+      - name: Hand-edited and damaged files
+        run: php tests/f23_reparar.php
+
+      - name: Every earlier version upgraded by this engine
+        run: php tests/f24_versiones_anteriores.php
+
+  windows:
+    # En Windows, renombrar encima de un fichero que otro proceso tiene
+    # abierto falla hasta que lo cierra: es lo que mira f25, y en Linux no se ve
+    runs-on: windows-latest
+    name: Windows, PHP 8.3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          coverage: none
+
+      - name: Files held open by another process while they are replaced
+        run: php tests/f25_ficheros_abiertos.php
+
+      # El motor entero también en Windows (2.10): rutas, renombrados y
+      # procesos hijos se comportan distinto. Con bash, cada orden que falla
+      # para el paso (con PowerShell solo contaba la última)
+      - name: Engine on Windows
+        shell: bash
+        run: |
+          php configurar.php --local
+          php tests/f1_nucleo.php
+          php tests/f2_parser.php
+          php tests/f2_select.php
+          php tests/f3_escrituras.php
+          php tests/f8_indices.php
+          php tests/f9_journal.php
+          php tests/f10_indices_incrementales.php
+          php tests/f23_reparar.php
+
+  phpstan:
+    # Análisis estático (2.10): PHPStan se descarga aquí, no es una
+    # dependencia del proyecto. phpstan-baseline.neon guarda lo que ya había
+    runs-on: ubuntu-latest
+    name: Static analysis (PHPStan)
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          tools: phpstan:2.1.40
+          coverage: none
+
+      - name: PHPStan
+        run: phpstan analyse -c phpstan.neon.dist --no-progress --memory-limit=2G
