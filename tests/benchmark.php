@@ -1,0 +1,291 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * Benchmark reproducible del motor.
+ *
+ *   php tests/benchmark.php              20.000 filas (por defecto)
+ *   php tests/benchmark.php 50000        el tamaño que quieras
+ *   php tests/benchmark.php 20000 csv    salida en CSV, para comparar versiones
+ *
+ * No es un test: no falla ni aprueba nada, solo mide. Está aquí para que
+ * cualquiera pueda repetir los números que cita el README en su propia máquina,
+ * en vez de creérselos. Los tiempos dependen mucho del disco y de la CPU, así
+ * que compara siempre contra una medida tuya, no contra la de otro.
+ *
+ * Cada operación se ejecuta varias veces y se toma la MEDIA de los tiempos.
+ *
+ * Usa la conexión directa al motor, sin HTTP: lo que se mide es el motor. El
+ * coste de la API se suma aparte y se documenta en docs/04-api.md.
+ *
+ * https://miguelenred.es/jsonsqldb
+ */
+
+define('JSONSQLDB_CONEXION_DIRECTA', true);
+// Sin caché de resultados: repetir la misma consulta la serviría de la caché y
+// lo que se quiere medir es el motor. Su efecto se mide aparte, al final.
+define('JSONSQLDB_CACHE_RESULTADOS', 0);
+require __DIR__ . '/../engine/bootstrap.php';
+
+use JsonSQLDB\Database;
+
+$filas  = max(100, (int)($argv[1] ?? 20000));
+$csv    = ($argv[2] ?? '') === 'csv';
+$raiz   = sys_get_temp_dir() . '/jsonsqldb_bench_' . getmypid();
+$version = trim((string)@file_get_contents(__DIR__ . '/../VERSION')) ?: 'desconocida';
+
+/** Media de $n repeticiones, en milisegundos. */
+function medir(callable $fn, int $n = 7): float
+{
+    $total = 0.0;
+    for ($i = 0; $i < $n; $i++) {
+        $t0 = microtime(true);
+        $fn();
+        $total += (microtime(true) - $t0) * 1000;
+    }
+    return $total / $n;
+}
+
+function limpiar(string $dir): void
+{
+    if (!is_dir($dir)) { return; }
+    foreach ((array)scandir($dir) as $e) {
+        if ($e === '.' || $e === '..') { continue; }
+        $r = "$dir/$e";
+        is_dir($r) ? limpiar($r) : @unlink($r);
+    }
+    @rmdir($dir);
+}
+
+limpiar($raiz);
+@mkdir($raiz, 0775, true);
+
+// ----------------------------------------------------------------------
+// Datos
+// ----------------------------------------------------------------------
+
+Database::crear('bench', $raiz);
+$bd = new Database('bench', $raiz);
+$bd->consultar('CREATE TABLE clientes (id INTEGER PRIMARY KEY, email VARCHAR(60) UNIQUE,
+                nombre VARCHAR(60), ciudad VARCHAR(20), edad INTEGER, saldo DECIMAL(10,2))');
+$bd->consultar('CREATE TABLE pedidos (id INTEGER PRIMARY KEY, cid INTEGER,
+                total DECIMAL(10,2), fecha DATE)');
+// Para la cascada: hijos con ON DELETE CASCADE (2.7.4)
+$bd->consultar('CREATE TABLE notas (id INTEGER PRIMARY KEY, cid INTEGER, texto VARCHAR(20),
+                FOREIGN KEY (cid) REFERENCES clientes (id) ON DELETE CASCADE)');
+
+// Semilla fija: dos ejecuciones comparan los mismos datos
+mt_srand(20260831);
+$ciudades = ['Madrid', 'Barcelona', 'Valencia', 'Sevilla', 'Elche',
+             'Zaragoza', 'Malaga', 'Alicante', 'Murcia', 'Bilbao'];
+
+$lote = [];
+for ($i = 1; $i <= $filas; $i++) {
+    $lote[] = [$i, "c$i@ejemplo.es", "Nombre Apellido $i",
+               $ciudades[mt_rand(0, 9)], mt_rand(18, 85), mt_rand(0, 500000) / 100];
+}
+$t0 = microtime(true);
+foreach (array_chunk($lote, 2000) as $bloque) {
+    $marcas = implode(',', array_fill(0, count($bloque), '(?,?,?,?,?,?)'));
+    $bd->consultar("INSERT INTO clientes VALUES $marcas", array_merge(...$bloque));
+}
+$cargaClientes = (microtime(true) - $t0) * 1000;
+
+$lote = [];
+$pedidos = (int)($filas * 1.5);
+for ($i = 1; $i <= $pedidos; $i++) {
+    $lote[] = [$i, mt_rand(1, $filas), mt_rand(100, 100000) / 100, '2026-06-01'];
+}
+foreach (array_chunk($lote, 2000) as $bloque) {
+    $marcas = implode(',', array_fill(0, count($bloque), '(?,?,?,?)'));
+    $bd->consultar("INSERT INTO pedidos VALUES $marcas", array_merge(...$bloque));
+}
+unset($lote);
+
+$lote = [];
+for ($i = 1; $i <= $filas; $i++) {
+    $lote[] = [$i, mt_rand(1, $filas), 'nota'];
+}
+foreach (array_chunk($lote, 2000) as $bloque) {
+    $marcas = implode(',', array_fill(0, count($bloque), '(?,?,?)'));
+    $bd->consultar("INSERT INTO notas VALUES $marcas", array_merge(...$bloque));
+}
+unset($lote);
+
+$bd->consultar('CREATE INDEX idx_ciudad ON clientes (ciudad)');
+
+// ----------------------------------------------------------------------
+// Medidas
+// ----------------------------------------------------------------------
+
+$medio  = intdiv($filas, 2);
+$ultimo = $filas;
+$nuevo  = $filas;
+
+/** @var array<string, array{0: float, 1: float}> etiqueta => [ms, MB] */
+$resultados = [];
+
+$correr = static function (string $etiqueta, callable $fn, int $n = 7) use (&$resultados): void {
+    if (function_exists('memory_reset_peak_usage')) {
+        memory_reset_peak_usage();                 // PHP 8.2+
+    }
+    $ms = medir($fn, $n);
+    $resultados[$etiqueta] = [$ms, memory_get_peak_usage() / 1048576];
+};
+
+$correr('Carga inicial (por lotes de 2.000)', static function () {}, 1);
+$resultados['Carga inicial (por lotes de 2.000)'] = [$cargaClientes, memory_get_peak_usage() / 1048576];
+
+$correr('Lectura por clave primaria',
+    static fn() => $bd->consultar('SELECT * FROM clientes WHERE id = ?', [$medio]));
+
+$correr('Lectura por columna UNIQUE',
+    static fn() => $bd->consultar('SELECT id FROM clientes WHERE email = ?', ["c$medio@ejemplo.es"]));
+
+$correr('IN de diez claves primarias',
+    static fn() => $bd->consultar('SELECT id FROM clientes WHERE id IN (?,?,?,?,?,?,?,?,?,?)',
+        [1, 7, 99, 500, 1000, $medio, $medio + 1, $ultimo - 2, $ultimo - 1, $ultimo]));
+
+// Clave primaria y una columna con un índice poco selectivo: tiene que ir por
+// la clave (2.7.4; antes leía todas las filas de esa ciudad)
+$correr('Clave primaria y columna con índice',
+    static fn() => $bd->consultar('SELECT * FROM clientes WHERE id = ? AND ciudad = ?', [$medio, 'Elche']));
+
+// Cien claves repartidas por toda la tabla (2.7.4)
+$correr('IN de cien claves repartidas',
+    static fn() => $bd->consultar('SELECT id FROM clientes WHERE id IN (' . implode(',', range(7, $filas, max(1, intdiv($filas, 100)))) . ')'));
+
+$correr('Igualdad sobre columna indexada',
+    static fn() => $bd->consultar("SELECT COUNT(*) AS n FROM clientes WHERE ciudad = 'Elche'"));
+
+$correr('Rango numérico (sin índice)',
+    static fn() => $bd->consultar('SELECT COUNT(*) AS n FROM clientes WHERE edad BETWEEN 30 AND 40'));
+
+$correr('Rango sobre la clave primaria',
+    static fn() => $bd->consultar('SELECT * FROM clientes WHERE id BETWEEN ? AND ?', [$medio, $medio + 999]));
+
+$correr('LIKE por prefijo',
+    static fn() => $bd->consultar("SELECT COUNT(*) AS n FROM clientes WHERE nombre LIKE 'Nombre Apellido 1%'"));
+
+$correr('LIMIT 50 sin filtro',
+    static fn() => $bd->consultar('SELECT id, email FROM clientes LIMIT 50'));
+
+$correr('LIMIT 100 con un OFFSET grande',
+    static fn() => $bd->consultar('SELECT id FROM clientes LIMIT 100 OFFSET ' . intdiv($filas, 4)), 5);
+
+$correr('Una columna de la tabla entera',
+    static fn() => $bd->consultar('SELECT id FROM clientes'), 5);
+
+$correr('COUNT(*) de la tabla entera',
+    static fn() => $bd->consultar('SELECT COUNT(*) AS n FROM pedidos'));
+
+$correr('GROUP BY con SUM',
+    static fn() => $bd->consultar('SELECT ciudad, COUNT(*) AS n, SUM(saldo) AS s
+                                   FROM clientes GROUP BY ciudad ORDER BY ciudad'));
+
+$correr('ORDER BY con LIMIT 20',
+    static fn() => $bd->consultar('SELECT id, saldo FROM clientes ORDER BY saldo DESC LIMIT 20'), 5);
+
+$correr('ORDER BY de dos columnas con LIMIT 1000',
+    static fn() => $bd->consultar('SELECT id, ciudad FROM clientes ORDER BY ciudad, id DESC LIMIT 1000'), 5);
+
+$correr('ORDER BY completo',
+    static fn() => $bd->consultar('SELECT id FROM clientes ORDER BY saldo DESC'), 5);
+
+$correr('JOIN agregado por ciudad',
+    static fn() => $bd->consultar('SELECT c.ciudad, COUNT(*) AS n, SUM(p.total) AS t
+                                   FROM pedidos p JOIN clientes c ON c.id = p.cid
+                                   GROUP BY c.ciudad ORDER BY c.ciudad'), 5);
+
+$correr('JOIN de un pedido con su cliente',
+    static fn() => $bd->consultar('SELECT p.id, c.nombre, p.total FROM pedidos p JOIN clientes c ON c.id = p.cid WHERE p.id = ?', [$medio]));
+
+$correr('LEFT JOIN de 20 pedidos con sus clientes',
+    static fn() => $bd->consultar('SELECT p.id, c.nombre FROM pedidos p LEFT JOIN clientes c ON c.id = p.cid WHERE p.id BETWEEN ? AND ?', [$medio, $medio + 19]));
+
+$correr('Subconsulta con IN',
+    static fn() => $bd->consultar("SELECT COUNT(*) AS n FROM pedidos
+                                   WHERE cid IN (SELECT id FROM clientes WHERE ciudad = 'Elche')"), 5);
+
+$correr('INSERT de una fila', static function () use ($bd, &$nuevo) {
+    $nuevo++;
+    $bd->consultar('INSERT INTO clientes VALUES (?,?,?,?,?,?)',
+        [$nuevo, "z$nuevo@ejemplo.es", 'Nueva', 'Madrid', 30, 1.0]);
+}, 5);
+
+$correr('UPDATE de una fila',
+    static fn() => $bd->consultar('UPDATE clientes SET saldo = ? WHERE id = ?',
+        [mt_rand(1, 999), $medio]), 5);
+
+$correr('DELETE de una fila', static function () use ($bd, &$nuevo) {
+    $bd->consultar('DELETE FROM clientes WHERE id = ?', [$nuevo]);
+    $nuevo++;
+    $bd->consultar('INSERT INTO clientes VALUES (?,?,?,?,?,?)',
+        [$nuevo, "z$nuevo@ejemplo.es", 'Nueva', 'Madrid', 30, 1.0]);
+}, 5);
+
+// Borrar 200 clientes con sus notas en cascada (2.7.4: antes recorría la
+// tabla de notas una vez por cliente). Se miden una vez: borran de verdad
+$correr('DELETE de 200 padres con cascada', static function () use ($bd, $medio) {
+    $bd->consultar('DELETE FROM clientes WHERE id BETWEEN ? AND ?', [$medio - 300, $medio - 101]);
+}, 1);
+
+// La caché de resultados, en un proceso aparte porque aquí está desactivada:
+// el JOIN de arriba, repetido sobre datos que no han cambiado
+$codigo = 'define("JSONSQLDB_CONEXION_DIRECTA", true);'
+        . 'require ' . var_export(__DIR__ . '/../engine/bootstrap.php', true) . ';'
+        . '$bd = new JsonSQLDB\\Database("bench", ' . var_export($raiz, true) . ');'
+        . '$sql = "SELECT c.ciudad, COUNT(*) AS n, SUM(p.total) AS t FROM pedidos p JOIN clientes c ON c.id = p.cid GROUP BY c.ciudad ORDER BY c.ciudad";'
+        . '$bd->consultar($sql); if (function_exists("memory_reset_peak_usage")) { memory_reset_peak_usage(); } $t0 = microtime(true);'
+        . 'for ($i = 0; $i < 7; $i++) { $bd->consultar($sql); }'
+        . 'echo (microtime(true) - $t0) * 1000 / 7, " ", memory_get_peak_usage() / 1048576;';
+$salida = trim((string)shell_exec(escapeshellarg(PHP_BINARY) . ' -d apc.enable_cli=' . (int)(function_exists('apcu_enabled') && apcu_enabled())
+        . ' -r ' . escapeshellarg($codigo) . ' 2>/dev/null'));
+if (preg_match('/^([\d.]+) ([\d.]+)$/', $salida, $m)) {
+    $resultados['JOIN repetido (caché de resultados)'] = [(float)$m[1], (float)$m[2]];
+}
+
+// ----------------------------------------------------------------------
+// Salida
+// ----------------------------------------------------------------------
+
+// Huella en disco: datos e índices por un lado y la caché por otro, que en
+// disco ocupa cerca del doble que los datos (ver docs/01-core.md)
+$huella = static function (string $patron): array {
+    $n = 0;
+    $bytes = 0;
+    foreach ((array)glob($patron) as $f) {
+        $n++;
+        $bytes += (int)filesize((string)$f);
+    }
+    return [$n, $bytes / 1048576];
+};
+[$fIdx, $mbIdx]   = $huella("$raiz/bench/*.idx.*.json");
+[$fTodo, $mbTodo] = $huella("$raiz/bench/*.json");
+[$fCache, $mbCache] = $huella("$raiz/bench/.cache/*.cache");
+$fDatos  = $fTodo - $fIdx;
+$mbDatos = $mbTodo - $mbIdx;
+
+if ($csv) {
+    echo "version,filas,operacion,ms,mb\n";
+    foreach ($resultados as $etiqueta => [$ms, $mb]) {
+        printf("%s,%d,\"%s\",%.2f,%.1f\n", $version, $filas, $etiqueta, $ms, $mb);
+    }
+} else {
+    printf("\njsonSQLDB %s · PHP %s · %s filas de clientes, %s de pedidos\n",
+        $version, PHP_VERSION, number_format($filas), number_format($pedidos));
+    printf("En disco: datos %.1f MB en %d ficheros, índices %.1f MB en %d, caché %.1f MB en %d (%s)\n",
+        $mbDatos, $fDatos, $mbIdx, $fIdx, $mbCache, $fCache,
+        function_exists('apcu_enabled') && apcu_enabled() ? 'y APCu' : 'en disco');
+    printf("Media de varias repeticiones. Mide el motor, sin HTTP.\n\n");
+    printf("  %-38s %10s %9s\n", 'operación', 'ms', 'pico MB');
+    echo '  ', str_repeat('-', 58), "\n";
+    foreach ($resultados as $etiqueta => [$ms, $mb]) {
+        printf("  %-38s %10.2f %9.1f\n", $etiqueta, $ms, $mb);
+    }
+    printf("\n  Las escrituras crecen con el tamaño de los índices, no con el de la tabla:\n");
+    printf("  se reescriben las partes que cambian y se corrigen los índices. Repite con\n");
+    printf("  otro tamaño para verlo.\n\n");
+}
+
+limpiar($raiz);
