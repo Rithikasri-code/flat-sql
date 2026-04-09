@@ -1,0 +1,578 @@
+<?php
+declare(strict_types=1);
+
+/**
+ * f10_indices_incrementales.php — el índice que se amplía en vez de rehacerse
+ *
+ * Rehacer el índice entero era el 67 % de lo que cuesta insertar una fila en una
+ * tabla grande, y casi siempre es trabajo repetido: si la escritura solo añade
+ * al final, las filas de antes no se mueven y sus claves son las mismas.
+ *
+ * El riesgo de esta optimización no es simétrico, y por eso tiene su propia
+ * suite:
+ *
+ *   - una entrada de MÁS en el índice solo hace la consulta más lenta, porque el
+ *     WHERE se vuelve a aplicar sobre las filas que se leen;
+ *   - una entrada de MENOS devuelve resultados incompletos, y nada lo delata:
+ *     no hay error, no hay aviso, solo faltan filas.
+ *
+ * Así que aquí no basta con «los tests pasan». Cada prueba compara el índice
+ * ampliado contra el que saldría de rehacerlo entero, y las consultas contra el
+ * mismo resultado sin índice. Si la salvaguarda que decide cuándo se puede
+ * ampliar se quita, esta suite tiene que ponerse roja.
+ *
+ * https://miguelenred.es/jsonsqldb
+ */
+
+define('JSONSQLDB_CONEXION_DIRECTA', true);
+define('JSONSQLDB_FILAS_POR_PARTE', 50);
+
+require_once __DIR__ . '/../engine/bootstrap.php';
+
+use JsonSQLDB\Catalog;
+use JsonSQLDB\Database;
+use JsonSQLDB\Indexes;
+use JsonSQLDB\IndexesEscritura;
+use JsonSQLDB\Storage;
+use JsonSQLDB\StorageCambios;
+use JsonSQLDB\StorageEscritura;
+
+$raiz = sys_get_temp_dir() . '/jsonsqldb_test_f10';
+$ok = 0; $ko = 0;
+
+function chk(string $titulo, callable $fn): void {
+    global $ok, $ko;
+    try {
+        $r = $fn();
+        if ($r === true) { $ok++; echo "  OK   $titulo\n"; }
+        else { $ko++; echo "  FALLO $titulo -> " . var_export($r, true) . "\n"; }
+    } catch (Throwable $e) {
+        $ko++;
+        echo "  FALLO $titulo -> " . get_class($e) . ': ' . $e->getMessage() . "\n";
+    }
+}
+
+function borrarArbol(string $dir): void {
+    if (!is_dir($dir)) { return; }
+    foreach ((array)scandir($dir) as $f) {
+        if ($f === '.' || $f === '..') { continue; }
+        $r = "$dir/$f";
+        is_dir($r) ? borrarArbol($r) : @unlink($r);
+    }
+    @rmdir($dir);
+}
+
+function resumen(): void {
+    global $ok, $ko;
+    echo "\n---------------------------------------\n";
+    echo "OK: $ok   FALLOS: $ko\n";
+    exit($ko === 0 ? 0 : 1);
+}
+
+borrarArbol($raiz);
+@mkdir($raiz, 0775, true);
+
+/** Crea una base con una tabla indexada y $n filas. */
+function preparar(string $raiz, int $n): Database
+{
+    borrarArbol("$raiz/x");
+    Database::crear('x', $raiz);
+    $bd = new Database('x', $raiz);
+    $bd->consultar('CREATE TABLE t (id INTEGER PRIMARY KEY, cod VARCHAR(20) UNIQUE,
+                                    ciudad VARCHAR(20), v VARCHAR(30))');
+    $bd->consultar('CREATE INDEX ix_ciudad ON t (ciudad)');
+    $bd->consultar('CREATE INDEX ix_comp ON t (ciudad, v)');
+
+    $ciudades = ['Madrid', 'Elche', 'Murcia', 'Bilbao'];
+    $filas = [];
+    for ($i = 1; $i <= $n; $i++) {
+        $filas[] = "($i, 'c$i', '" . $ciudades[$i % 4] . "', 'v" . ($i % 7) . "')";
+    }
+    $bd->consultar('INSERT INTO t VALUES ' . implode(',', $filas));
+    return $bd;
+}
+
+/**
+ * Los índices tal y como están en disco, juntando los trozos de cada uno
+ * (uno por parte de la tabla) y sin las revisiones, que suben siempre. Cada
+ * trozo tiene que decir qué parte cubre y solo posiciones de esa parte.
+ *
+ * @return array<string, array>
+ */
+function indicesEnDisco(string $raiz): array
+{
+    $out = [];
+    foreach ((array)glob("$raiz/x/t.idx.*.json") as $f) {
+        $j = json_decode((string)file_get_contents((string)$f), true);
+        $nombre = preg_replace('/\.part\d+$/', '', basename((string)$f, '.json'));
+        if (!is_array($j) || !is_array($j['keys'] ?? null)) {
+            $out[$nombre . '.json'] = ['error' => 'trozo ilegible: ' . basename((string)$f)];
+            continue;
+        }
+        $parte  = (int)($j['part'] ?? 0);
+        if (preg_match('/\.part(\d+)\.json$/', (string)$f, $m) ? (int)$m[1] !== $parte : $parte !== 1) {
+            $out[$nombre . '.json'] = ['error' => 'trozo mal numerado: ' . basename((string)$f)];
+            continue;
+        }
+        $desde = ($parte - 1) * (int)JSONSQLDB_FILAS_POR_PARTE;
+        $hasta = $desde + (int)JSONSQLDB_FILAS_POR_PARTE;
+        $out[$nombre . '.json'] ??= ['index' => $j['index'], 'columns' => $j['columns'], 'chunk' => $j['chunk'], 'keys' => []];
+        foreach ($j['keys'] as $k => $p) {
+            foreach ((array)$p as $pos) {
+                if ($pos < $desde || $pos >= $hasta) {
+                    $out[$nombre . '.json']['error'] = "posición $pos fuera de su trozo (" . basename((string)$f) . ')';
+                }
+                IndexesEscritura::anotar($out[$nombre . '.json']['keys'], (string)$k, (int)$pos);
+            }
+        }
+    }
+    ksort($out);
+    return $out;
+}
+
+/** Rehace todos los índices desde cero y devuelve cómo quedarían. */
+function indicesRehechos(string $raiz): array
+{
+    $st = new Storage($raiz, 'x');
+    $st->bloquear(true);
+    $cat   = new Catalog($st);
+    $meta  = $cat->meta('t');
+    $filas = StorageEscritura::leerFilas($st, 't', true);
+    $st->desbloquear();
+    unset($st, $cat);
+
+    $out = [];
+    foreach (Indexes::definiciones($meta) as $def) {
+        $out["t.idx.{$def['name']}.json"] = [
+            'index'   => $def['name'],
+            'columns' => $def['columns'],
+            'chunk'   => (int)JSONSQLDB_FILAS_POR_PARTE,
+            'rows'    => count($filas),
+            'keys'    => StorageEscritura::construir($filas, $def['columns']),
+        ];
+    }
+    ksort($out);
+    return $out;
+}
+
+/** Compara el índice de disco con el que saldría de rehacerlo. */
+function cuadraConRehacerlo(string $raiz): bool|string
+{
+    $enDisco  = indicesEnDisco($raiz);
+    $rehechos = indicesRehechos($raiz);
+    if (array_keys($enDisco) !== array_keys($rehechos)) {
+        return 'no están los mismos índices: ' . implode(',', array_keys($enDisco))
+             . ' frente a ' . implode(',', array_keys($rehechos));
+    }
+    foreach ($rehechos as $nombre => $esperado) {
+        $hay = $enDisco[$nombre];
+        if (isset($hay['error'])) {
+            return "$nombre: {$hay['error']}";
+        }
+        if ($hay['columns'] !== $esperado['columns'] || $hay['chunk'] !== $esperado['chunk']) {
+            return "$nombre no describe las columnas o el tamaño de parte esperados";
+        }
+        // Un índice corregido no lleva las claves en el mismo orden que uno
+        // rehecho, y una posición suelta se guarda como entero: se normaliza
+        $normal = static function (array $keys): array {
+            foreach ($keys as $k => $p) { $keys[$k] = (array)$p; sort($keys[$k]); }
+            ksort($keys);
+            return $keys;
+        };
+        $hayKeys = $normal((array)($hay['keys'] ?? []));
+        $espKeys = $normal($esperado['keys']);
+        if ($hayKeys !== $espKeys) {
+            // Qué falta y qué sobra, que es lo que hace falta para depurarlo
+            $faltan = $sobran = 0;
+            foreach ($espKeys as $k => $posiciones) {
+                $faltan += count(array_diff($posiciones, $hayKeys[$k] ?? []));
+            }
+            foreach ($hayKeys as $k => $posiciones) {
+                $sobran += count(array_diff($posiciones, $espKeys[$k] ?? []));
+            }
+            return "$nombre no cuadra: faltan $faltan posiciones, sobran $sobran";
+        }
+    }
+    return true;
+}
+
+/**
+ * La consulta por índice tiene que devolver lo mismo que sin él.
+ *
+ * El `OR 1 = 0` impide usar el índice sin cambiar qué filas cumplen: es el mismo
+ * truco que usa f8_indices.
+ */
+function igualQueSinIndice(Database $bd, string $where): bool|string
+{
+    $con = $bd->consultar("SELECT id FROM t WHERE $where ORDER BY id");
+    $sin = $bd->consultar("SELECT id FROM t WHERE ($where) OR 1 = 0 ORDER BY id");
+    if ($con === $sin) {
+        return true;
+    }
+    $idsCon = array_column($con, 'id');
+    $idsSin = array_column($sin, 'id');
+    return sprintf('con índice %d filas, sin índice %d (faltan %s)',
+        count($idsCon), count($idsSin),
+        implode(',', array_slice(array_diff($idsSin, $idsCon), 0, 5)) ?: 'ninguna');
+}
+
+// ----------------------------------------------------------------------
+
+echo "== Insertar al final amplía el índice sin rehacerlo ==\n";
+
+chk('tras insertar una fila, el índice es el mismo que si se rehiciera', function () use ($raiz) {
+    $bd = preparar($raiz, 500);
+    $bd->consultar("INSERT INTO t VALUES (9001, 'z1', 'Madrid', 'v3')");
+    $r = cuadraConRehacerlo($raiz);
+    unset($bd);
+    return $r;
+});
+
+chk('la fila nueva se encuentra por el índice', function () use ($raiz) {
+    $bd = new Database('x', $raiz);
+    $r = igualQueSinIndice($bd, "ciudad = 'Madrid'");
+    if ($r !== true) { return $r; }
+    $hay = $bd->consultar("SELECT id FROM t WHERE ciudad = 'Madrid' AND v = 'v3' ORDER BY id");
+    unset($bd);
+    return in_array(9001, array_column($hay, 'id'), true)
+        ?: 'la fila recién insertada no aparece buscando por el índice compuesto';
+});
+
+chk('muchas inserciones seguidas siguen cuadrando', function () use ($raiz) {
+    $bd = preparar($raiz, 300);
+    for ($i = 1; $i <= 25; $i++) {
+        $bd->consultar('INSERT INTO t VALUES (?, ?, ?, ?)',
+            [10000 + $i, "y$i", $i % 2 ? 'Elche' : 'Madrid', 'v' . ($i % 7)]);
+    }
+    $r = cuadraConRehacerlo($raiz);
+    if ($r !== true) { unset($bd); return $r; }
+    $r = igualQueSinIndice($bd, "ciudad = 'Elche'");
+    unset($bd);
+    return $r;
+});
+
+chk('un INSERT de varias filas de golpe también', function () use ($raiz) {
+    $bd = preparar($raiz, 400);
+    $bd->consultar("INSERT INTO t VALUES (8001,'w1','Bilbao','v1'),
+                                        (8002,'w2','Bilbao','v2'),
+                                        (8003,'w3','Murcia','v1')");
+    $r = cuadraConRehacerlo($raiz);
+    if ($r !== true) { unset($bd); return $r; }
+    $r = igualQueSinIndice($bd, "ciudad = 'Bilbao'");
+    unset($bd);
+    return $r;
+});
+
+echo "\n== Cuando NO se puede ampliar, se rehace ==\n";
+
+chk('un UPDATE de una fila del medio no reutiliza el índice viejo', function () use ($raiz) {
+    // Cambiar una fila indexada cambia su clave: la entrada de antes tiene que
+    // desaparecer, y ampliando el índice se quedaría.
+    $bd = preparar($raiz, 400);
+    $bd->consultar("UPDATE t SET ciudad = 'Vigo' WHERE id = 200");
+    $r = cuadraConRehacerlo($raiz);
+    if ($r !== true) { unset($bd); return $r; }
+    $r = igualQueSinIndice($bd, "ciudad = 'Vigo'");
+    if ($r !== true) { unset($bd); return $r; }
+    $r = igualQueSinIndice($bd, "ciudad = 'Madrid'");
+    unset($bd);
+    return $r;
+});
+
+chk('un DELETE del medio mueve todas las posiciones de detrás', function () use ($raiz) {
+    // Es el caso más peligroso: al compactar, cada fila posterior cambia de
+    // posición, así que TODAS las entradas del índice viejo son incorrectas.
+    $bd = preparar($raiz, 400);
+    $bd->consultar('DELETE FROM t WHERE id = 5');
+    $r = cuadraConRehacerlo($raiz);
+    if ($r !== true) { unset($bd); return $r; }
+    $r = igualQueSinIndice($bd, "ciudad = 'Elche'");
+    unset($bd);
+    return $r;
+});
+
+chk('borrar y luego insertar, en la misma sentencia y en distintas', function () use ($raiz) {
+    $bd = preparar($raiz, 300);
+    $bd->consultar('DELETE FROM t WHERE id > 290');
+    $bd->consultar("INSERT INTO t VALUES (7001, 'q1', 'Elche', 'v0')");
+    $r = cuadraConRehacerlo($raiz);
+    if ($r !== true) { unset($bd); return $r; }
+    $r = igualQueSinIndice($bd, "ciudad = 'Elche'");
+    unset($bd);
+    return $r;
+});
+
+chk('un UPDATE que no toca columnas indexadas tampoco rompe nada', function () use ($raiz) {
+    $bd = preparar($raiz, 300);
+    $bd->consultar("UPDATE t SET cod = 'nuevo' WHERE id = 150");
+    $r = cuadraConRehacerlo($raiz);
+    unset($bd);
+    return $r;
+});
+
+chk('crear un índice nuevo con la tabla ya llena', function () use ($raiz) {
+    $bd = preparar($raiz, 300);
+    $bd->consultar("INSERT INTO t VALUES (6001, 'p1', 'Madrid', 'v1')");
+    $bd->consultar('CREATE INDEX ix_v ON t (v)');
+    $r = cuadraConRehacerlo($raiz);
+    if ($r !== true) { unset($bd); return $r; }
+    $r = igualQueSinIndice($bd, "v = 'v1'");
+    unset($bd);
+    return $r;
+});
+
+chk('ALTER TABLE que cambia las columnas rehace los índices', function () use ($raiz) {
+    $bd = preparar($raiz, 200);
+    $bd->consultar('ALTER TABLE t ADD COLUMN extra VARCHAR(10)');
+    $bd->consultar("INSERT INTO t VALUES (5001, 'o1', 'Murcia', 'v2', 'e')");
+    $r = cuadraConRehacerlo($raiz);
+    if ($r !== true) { unset($bd); return $r; }
+    $r = igualQueSinIndice($bd, "ciudad = 'Murcia'");
+    unset($bd);
+    return $r;
+});
+
+echo "\n== El índice de disco no se toma por bueno sin comprobarlo ==\n";
+
+chk('un índice con un recuento de filas que no cuadra se rehace', function () use ($raiz) {
+    // Es la salvaguarda: si el índice viejo se hizo con otro número de filas,
+    // sus posiciones no son las de ahora. Se falsea a mano y la siguiente
+    // inserción tiene que rehacerlo en vez de ampliarlo.
+    $bd = preparar($raiz, 300);
+    unset($bd);
+
+    $f = "$raiz/x/t.idx.ix_ciudad.json";
+    $j = json_decode((string)file_get_contents($f), true);
+    $j['rows'] = 999;                              // mentira
+    file_put_contents($f, json_encode($j) . "\n");
+
+    $bd = new Database('x', $raiz);
+    $bd->consultar("INSERT INTO t VALUES (4001, 'n1', 'Elche', 'v1')");
+    $r = cuadraConRehacerlo($raiz);
+    if ($r !== true) { unset($bd); return $r; }
+    $r = igualQueSinIndice($bd, "ciudad = 'Elche'");
+    unset($bd);
+    return $r;
+});
+
+chk('un índice de otra revisión se rehace', function () use ($raiz) {
+    $bd = preparar($raiz, 300);
+    unset($bd);
+
+    $f = "$raiz/x/t.idx.ix_ciudad.json";
+    $j = json_decode((string)file_get_contents($f), true);
+    $j['rev'] = 99999;                             // de otro momento
+    file_put_contents($f, json_encode($j) . "\n");
+
+    $bd = new Database('x', $raiz);
+    $bd->consultar("INSERT INTO t VALUES (4002, 'n2', 'Elche', 'v1')");
+    $r = cuadraConRehacerlo($raiz);
+    unset($bd);
+    return $r;
+});
+
+chk('un índice ilegible se rehace en vez de romper', function () use ($raiz) {
+    $bd = preparar($raiz, 200);
+    unset($bd);
+
+    file_put_contents("$raiz/x/t.idx.ix_ciudad.json", '{ esto no es JSON');
+
+    $bd = new Database('x', $raiz);
+    $bd->consultar("INSERT INTO t VALUES (4003, 'n3', 'Madrid', 'v1')");
+    $r = cuadraConRehacerlo($raiz);
+    if ($r !== true) { unset($bd); return $r; }
+    $r = igualQueSinIndice($bd, "ciudad = 'Madrid'");
+    unset($bd);
+    return $r;
+});
+
+chk('un índice cuyas columnas ya no son las de la tabla se rehace', function () use ($raiz) {
+    $bd = preparar($raiz, 200);
+    unset($bd);
+
+    $f = "$raiz/x/t.idx.ix_ciudad.json";
+    $j = json_decode((string)file_get_contents($f), true);
+    $j['columns'] = ['v'];                         // no es lo que define el índice
+    file_put_contents($f, json_encode($j) . "\n");
+
+    $bd = new Database('x', $raiz);
+    $bd->consultar("INSERT INTO t VALUES (4004, 'n4', 'Bilbao', 'v1')");
+    $r = cuadraConRehacerlo($raiz);
+    if ($r !== true) { unset($bd); return $r; }
+    $r = igualQueSinIndice($bd, "ciudad = 'Bilbao'");
+    unset($bd);
+    return $r;
+});
+
+echo "\n== Valores que suelen romper las claves ==\n";
+
+chk('NULL, cadenas vacías y números en columnas indexadas', function () use ($raiz) {
+    borrarArbol("$raiz/x");
+    Database::crear('x', $raiz);
+    $bd = new Database('x', $raiz);
+    $bd->consultar('CREATE TABLE t (id INTEGER PRIMARY KEY, cod VARCHAR(20) UNIQUE,
+                                    ciudad VARCHAR(20), v VARCHAR(30))');
+    $bd->consultar('CREATE INDEX ix_ciudad ON t (ciudad)');
+    $bd->consultar('CREATE INDEX ix_comp ON t (ciudad, v)');
+    $bd->consultar("INSERT INTO t VALUES (1,'a',NULL,'x'), (2,'b','','y'), (3,'c','0','z')");
+
+    // Se añaden más de los mismos, que es cuando se amplía el índice
+    $bd->consultar("INSERT INTO t VALUES (4,'d',NULL,'x')");
+    $bd->consultar("INSERT INTO t VALUES (5,'e','','y')");
+    $bd->consultar("INSERT INTO t VALUES (6,'f','0','z')");
+
+    $r = cuadraConRehacerlo($raiz);
+    if ($r !== true) { unset($bd); return $r; }
+    foreach (["ciudad = ''", "ciudad = '0'", 'ciudad IS NULL'] as $where) {
+        $r = igualQueSinIndice($bd, $where);
+        if ($r !== true) { unset($bd); return "$where -> $r"; }
+    }
+    unset($bd);
+    return true;
+});
+
+echo "\n== UPDATE que no cambia la clave de un índice (2.7.4) ==\n";
+chk('un UPDATE que no toca las columnas de un índice deja sus trozos como estaban, y el resto cuadra', function () use ($raiz) {
+    // Solo se tocan los trozos cuyas claves cambian: v está en ix_comp pero no
+    // en ix_ciudad ni en la clave única
+    $bd = preparar($raiz, 300);
+    $huella = static function () use ($raiz): string {
+        $h = '';
+        foreach (glob("$raiz/x/t.idx.ix_ciudad*") ?: [] as $f) { $h .= basename($f) . md5_file($f); }
+        return $h;
+    };
+    $antes = $huella();
+    $bd->consultar("UPDATE t SET v = 'cambiado' WHERE id % 3 = 0");
+    $despues = $huella();
+    unset($bd);
+    if ($antes === '' || $antes !== $despues) { return 'los trozos de ix_ciudad han cambiado'; }
+    return cuadraConRehacerlo($raiz);
+});
+
+chk('con la última parte a medias, un UPDATE tampoco toca el último trozo; borrar la última fila, añadir y borrar en medio sí, y cuadra (2.9)', function () use ($raiz) {
+    // 123 filas en partes de 50: la última tiene 23. La cola de los índices
+    // solo se rehace si hay filas añadidas o que se mueven
+    $bd = preparar($raiz, 123);
+    $huella = static function () use ($raiz): string {
+        $h = '';
+        foreach (glob("$raiz/x/t.idx.ix_ciudad*") ?: [] as $f) { $h .= basename($f) . md5_file($f); }
+        return $h;
+    };
+    $antes = $huella();
+    $bd->consultar("UPDATE t SET v = 'cambiado' WHERE id = 10");
+    if ($antes === '' || $antes !== $huella()) { return 'un UPDATE de v ha tocado los trozos de ix_ciudad'; }
+    foreach (['DELETE FROM t WHERE id = 123', "INSERT INTO t VALUES (200, 'c200', 'Elche', 'v1')", 'DELETE FROM t WHERE id = 60'] as $q) {
+        $bd->consultar($q);
+        $r = cuadraConRehacerlo($raiz);
+        if ($r !== true) { return "tras $q: " . json_encode($r); }
+    }
+    return true;
+});
+
+chk('el menor y el mayor de texto guardados en la caché nunca esconden una fila cambiada después (2.9)', function () use ($raiz) {
+    // Un rango de texto guarda el menor y el mayor de cada trozo, con su
+    // revisión; si el trozo cambia, lo guardado deja de valer
+    $bd = preparar($raiz, 300);
+    $bd->consultar('CREATE INDEX ix_v ON t (v)');
+    $antes = $bd->consultar("SELECT id FROM t WHERE v > 'v5' ORDER BY id");     // guarda los límites
+    $bd->consultar("UPDATE t SET v = 'zz' WHERE id = 120");                       // fuera de los de su trozo
+    $r = [$bd->consultar("SELECT id FROM t WHERE v >= 'zz'"), $bd->consultar("SELECT id FROM t WHERE v > 'v5' ORDER BY id") === $bd->consultar("SELECT id FROM t WHERE v || '' > 'v5' ORDER BY id")];
+    unset($bd);
+    return $antes !== [] && $r[0] === [['id' => 120]] && $r[1] === true && cuadraConRehacerlo($raiz) === true ?: json_encode($r);
+});
+
+chk('una escritura por partes en una tabla sin rangos en su estado (de antes de la 2.7) deja cada rango en su trozo: una búsqueda por número no se salta el que la tiene (2.9)', function () use ($raiz) {
+    // Al juntar sus cambios, el rango del único trozo que reescribía quedaba
+    // el primero de la lista, y la búsqueda de un número del primer trozo lo
+    // descartaba por ese rango: ninguna fila
+    borrarArbol("$raiz/x");
+    Database::crear('x', $raiz);
+    $bd = new Database('x', $raiz);
+    $bd->consultar('CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)');
+    $bd->consultar('CREATE INDEX ix_n ON t (n)');
+    $bd->consultar('INSERT INTO t VALUES ' . implode(',', array_map(static fn(int $i): string => "($i, $i)", range(1, 150))));
+    $f = "$raiz/x/t.rev.json";
+    $e = json_decode((string)file_get_contents($f), true);
+    unset($e['rangos']);
+    file_put_contents($f, json_encode($e, JSON_PRETTY_PRINT) . "\n");
+    touch($f, time() - 10);
+    $antes = StorageCambios::cuentaPartes()[0];
+    $bd = new Database('x', $raiz);
+    $bd->consultar('UPDATE t SET n = 500 WHERE id = 75');                        // la segunda parte, por partes
+    $r = [StorageCambios::cuentaPartes()[0] - $antes, $bd->consultar('SELECT id FROM t WHERE n = 10'),
+          $bd->consultar('SELECT id FROM t WHERE n = 500'), $bd->consultar('SELECT id FROM t WHERE n = 140')];
+    unset($bd);
+    return $r === [1, [['id' => 10]], [['id' => 75]], [['id' => 140]]] && cuadraConRehacerlo($raiz) === true ?: json_encode($r);
+});
+
+echo "\n== Un trozo de índice cortado (2.7.4) ==\n";
+chk('un trozo con la cabecera bien y el final cortado no se da por bueno: la clave única sigue mandando', function () use ($raiz) {
+    // indiceValido() mira la cabecera y el final de cada trozo, y recuerda el
+    // veredicto mientras no cambien sus revisiones. Un trozo que un corte deja
+    // cortado (el final a medias) tiene que darse por malo, y la escritura
+    // comprobar la clave única sin él
+    $bd = preparar($raiz, 300);
+    unset($bd);
+    $trozos = glob("$raiz/x/t/*cod*") ?: glob("$raiz/x/t*/*cod*") ?: [];
+    if ($trozos === []) {
+        $todos = [];
+        $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator("$raiz/x", FilesystemIterator::SKIP_DOTS));
+        foreach ($it as $f) { if (str_contains($f->getFilename(), 'cod')) { $todos[] = $f->getPathname(); } }
+        $trozos = $todos;
+    }
+    if ($trozos === []) { return 'no encuentro los trozos del índice único'; }
+    sort($trozos);
+    $f = $trozos[0];
+    $texto = (string)file_get_contents($f);
+    file_put_contents($f, substr($texto, 0, (int)(strlen($texto) * 0.6)));   // el final, cortado
+    $bd = new Database('x', $raiz);
+    try {
+        $bd->consultar("INSERT INTO t VALUES (9999, 'c1', 'Madrid', 'v1')");   // c1 ya existe
+        $r = 'admitió un código repetido';
+    } catch (JsonSQLDB\JsonSqlDbError $e) {
+        $r = str_contains($e->getMessage(), 'c1') || stripos($e->getMessage(), 'únic') !== false || stripos($e->getMessage(), 'unique') !== false
+            ? true : 'otro error: ' . $e->getMessage();
+    }
+    $bien = $bd->consultar("SELECT COUNT(*) AS n FROM t WHERE cod = 'c2'")[0]['n'] ?? null;
+    unset($bd);
+    return $r === true && (int)$bien === 1 ?: (is_string($r) ? $r : "c2 aparece $bien veces");
+});
+
+echo "\n== Filas añadidas una a una (2.10) ==\n";
+chk('130 INSERT de una fila: el filtro y el rango de cada trozo se amplían sin rehacerlos, CHECK INDEXES no ve nada, cada correo y cada número se encuentran y el rango guardado es el de sus claves', function () use ($raiz) {
+    Database::crear('amp', $raiz);
+    $bd = new Database('amp', $raiz);
+    $bd->consultar('CREATE TABLE u (id INTEGER PRIMARY KEY, email TEXT UNIQUE, n INTEGER)');
+    $bd->consultar('CREATE INDEX ix_n ON u (n)');
+    for ($i = 1; $i <= 130; $i++) {
+        $bd->consultar('INSERT INTO u VALUES (?, ?, ?)', [$i, "persona$i@ejemplo.es", ($i * 37) % 101 - 50]);
+    }
+    $problemas = $bd->consultar('CHECK INDEXES');
+    $faltan = [];
+    for ($i = 1; $i <= 130; $i++) {
+        if ((int)$bd->consultar('SELECT COUNT(*) AS c FROM u WHERE email = ?', ["persona$i@ejemplo.es"])[0]['c'] !== 1) {
+            $faltan[] = "email $i";
+        }
+        if ((int)$bd->consultar('SELECT COUNT(*) AS c FROM u WHERE n = ?', [($i * 37) % 101 - 50])[0]['c'] < 1) {
+            $faltan[] = "n $i";
+        }
+    }
+    $nada = (int)$bd->consultar("SELECT COUNT(*) AS c FROM u WHERE email = 'nadie@ejemplo.es'")[0]['c'];
+    $estado = json_decode((string)file_get_contents("$raiz/amp/u.rev.json"), true);
+    $rangos = [];
+    foreach ($estado['indexes']['ix_n'] as $p => $_) {
+        $trozo = json_decode((string)file_get_contents("$raiz/amp/u.idx.ix_n" . ($p === 0 ? '' : '.part' . ($p + 1)) . '.json'), true);
+        $rangos[] = IndexesEscritura::rango($trozo['keys']) === $estado['rangos']['ix_n'][$p];
+    }
+    unset($bd);
+    return $problemas === [] && $faltan === [] && $nada === 0 && $rangos !== [] && !in_array(false, $rangos, true)
+        ?: json_encode([$problemas, $faltan, $nada, $rangos], JSON_UNESCAPED_UNICODE);
+});
+
+echo "\n== Limpieza ==\n";
+chk('sin restos', function () use ($raiz) {
+    borrarArbol($raiz);
+    return !is_dir($raiz);
+});
+
+resumen();
