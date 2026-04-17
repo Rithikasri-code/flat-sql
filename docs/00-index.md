@@ -1,0 +1,162 @@
+# jsonSQLDB
+
+The version is in the [VERSION](../VERSION) file; what changed in each one, in
+the [CHANGELOG](../CHANGELOG.md). The number is deliberately not repeated here:
+written by hand it falls behind without anyone noticing, which is exactly what
+happened to this document for three versions.
+
+An SQL database on JSON files, in pure PHP. No Composer, no unusual extensions
+and no database server: copy the folder and it works.
+
+Three rules guide every design decision, and are written in full in the
+[README](../README.md#principles): **the data stays readable by a person**
+(plain JSON, one row per line, no binary or compressed format), **it runs on
+cheap hosting** (no database server, no extensions, small `memory_limit`,
+nothing resident between requests), and **it does as few disk operations as it
+can** (writes touch only what they change and force to disk only what must
+survive a power cut). When an optimisation would break one of them, it is not
+done.
+
+> **PHP 8.0 is supported, but 8.1 or later is recommended.** 8.0 has no
+> `fsync()`, the call that forces data onto the disk, and there is no reliable
+> substitute in plain PHP; so on 8.0 a power cut can lose roughly the last 30
+> seconds of writes. The full explanation is in the
+> [README](../README.md#php-80-works-but-81-or-later-is-recommended).
+
+Three pieces, each on top of the previous one:
+
+```
+jsonsqldbadmin/   web panel          →  talks to the API, or loads the engine directly (2.7)
+api/              signed HTTP API    →  talks only to the engine
+engine/           SQL engine         →  reads and writes data/
+data/             one folder per database, a few JSON files per table
+```
+
+## Documentation
+
+> **Coming from an earlier version?** Read
+> [Upgrading from an earlier version](01-core.md#12-upgrading-from-an-earlier-version)
+> before replacing the folder. The data needs no conversion, but if you come
+> from 1.x **the HMAC signature of the API changed** and your own clients stop
+> working until they are updated. From 2.9 or earlier, **texts that are numbers
+> compare as texts** since 2.10 (`'7' = '007'` is false), `LIKE` ignores the
+> case of `A` to `Z` only and `SUM` past 64 bits is an error, as in SQLite, and
+> the indexes on `TEXT` columns are rebuilt once, on their own: see the
+> [changelog](../CHANGELOG.md).
+
+| Document | What it covers |
+|---|---|
+| [01-core.md](01-core.md) | storage, types, locking, journal, indexes, memory, files and space (tuning for a hosting plan), configuration, log, where the floor is, upgrading |
+| [02-queries.md](02-queries.md) | `SELECT`: syntax, functions, alphabetical order, performance |
+| [03-writes.md](03-writes.md) | `INSERT`/`UPDATE`/`DELETE`, DDL, keys, triggers, views, integrity |
+| [04-api.md](04-api.md) | HTTP endpoint, HMAC signature, bound parameters, clients |
+| [05-admin.md](05-admin.md) | jsonSQLDBadmin: installation, users, what it can do, import and export with other engines and without size limits, Excel, scheduled backups, languages, configuration |
+| [06-format.md](06-format.md) | reference of the files on disk: each file's exact shape, values by type, index keys, journal, transactions, repairs; reading and changing them from outside |
+| [../nginx/README.md](../nginx/README.md) | **Required if you use nginx**: the equivalent of the `.htaccess` rules |
+| [../litespeed/README.md](../litespeed/README.md) | LiteSpeed Enterprise (works as Apache) and OpenLiteSpeed (**needs the rules in the vhost**) |
+
+## Where to start
+
+**If your server is nginx or OpenLiteSpeed**, read `nginx/README.md` or
+`litespeed/README.md` first. The project ships `.htaccess` and `web.config`,
+which nginx does not read and OpenLiteSpeed only reads in part: without the
+rules in those folders, `data/` is reachable from the browser and anyone can
+download your tables. LiteSpeed Enterprise reads `.htaccess` like Apache and
+needs nothing.
+
+**Install**: upload the folder to the server, run `php configurar.php` to
+create both configuration files with random keys (or `--local` for plain HTTP
+on your own machine), and open `jsonsqldbadmin/`. The first screen asks for the
+installation code that `configurar.php` prints and lets you create the
+administrator. Details in [05-admin.md §1](05-admin.md).
+
+**Create the first database**: from the panel (*Databases → New database*),
+with `CREATE DATABASE mydb` through the API with an empty `db`, or with
+`JsonSQLDB\Database::crear('mydb')` from PHP.
+
+**Query from an application**: copy the client that suits you
+(`api/cliente_ejemplo.php`, `.ps1` for PowerShell, `.py` for Python) and always
+use bound parameters:
+
+```php
+$rows = $cli->consultar('SELECT * FROM customers WHERE city = ?', ['Malaga']);
+```
+
+## Worth knowing first
+
+- **Values are never concatenated into the SQL.** Write `?` and send the values
+  apart; the server inserts them already parsed. See [04-api.md §1.1](04-api.md).
+- **The database goes in the `db` parameter**, not in the SQL. There is no
+  `mydb.customers`, `USE` only accepts the database already in use (2.9), and a
+  query does not span two databases.
+- **Several statements can be one transaction** (2.9): all of them or none.
+  While it runs the whole database waits for it, and it never spans requests.
+  See [03-writes.md](03-writes.md).
+- **Texts and numbers compare as in SQLite** (2.10): by the affinity of the
+  column, so in a `TEXT` column `'7'` and `'007'` are two values, and `'10'`
+  sorts before `'9'`. See [02-queries.md](02-queries.md).
+- **`DECIMAL` is rounded floating point**, not exact decimal. For money that
+  has to add up to the cent, store cents in an `INTEGER`. See
+  [01-core.md](01-core.md).
+- **Alphabetical order is configurable** (`JSONSQLDB_COLACION`): by default it
+  ignores case and accents and puts `ñ` after `n`. It only affects `ORDER BY`;
+  for a column that compares without telling case apart, declare it
+  `COLLATE NOCASE` (2.9). See [02-queries.md](02-queries.md).
+- **`ALTER TABLE` cannot do everything**: it adds, modifies and drops columns,
+  unique, foreign and primary keys, but `AUTOINCREMENT` can only be set when
+  the table is created. See [03-writes.md](03-writes.md).
+- **Batch your `INSERT`s.** One statement with many `VALUES` is far cheaper
+  than many statements; see [02-queries.md](02-queries.md).
+- **On a hosting with an inode quota**, read
+  [01-core.md §9](01-core.md#9-files-space-and-how-to-tune-them): what makes
+  files, and which settings trade files for speed.
+
+## Tests
+
+The test files, no dependencies. They use temporary folders and never touch your
+data. The ones that load dumps into other systems or run PowerShell scripts do
+more where those are installed (CI has them).
+
+```
+php tests/f1_nucleo.php       → OK: 76    storage, types, locking, direct access
+php tests/f2_parser.php       → OK: 86    parser and bound parameters
+php tests/f2_select.php       → OK: 165   SELECT execution and collation
+php tests/f3_escrituras.php   → OK: 122   writes, DDL, keys, triggers, transactions and holes
+php tests/f4_api.php          → OK: 84    real requests against the API
+php tests/f5_esquema.php      → OK: 125   SHOW, ALTER, CREATE TABLE … AS, constraints, views, integrity, journal, result cache
+php tests/f5_admin.php        → OK: 189   the panel, driven like a user
+php tests/f6_cortes.php       → OK: 36    crash recovery, killing real processes
+php tests/f7_concurrencia.php → OK: 35    real simultaneous processes and locking
+php tests/f8_indices.php      → OK: 93    indexes, against a full scan every time
+php tests/f9_journal.php      → OK: 36    every intermediate state a crash can leave
+php tests/f10_indices_incrementales.php → OK: 22   indexes corrected instead of rebuilt
+php tests/f11_asistente.php    → OK: 45    panel setup wizard and direct connection
+php tests/f12_contra_sqlite.php → OK: 16   238 queries, 32 writes and 8 triggers that touch rows of their own statement, same results as SQLite
+php tests/f13_fuzz_contra_sqlite.php → OK: 2000  random queries against SQLite (day's seed; --n, --semilla)
+php tests/f14_volcados.php     → OK: 65    dumps to and from SQLite, MySQL, PostgreSQL, SQL Server (more with the servers)
+php tests/f15_idiomas.php      → OK: 6     the panel's translations and the choice of language
+php tests/f16_vistas_triggers.php → OK: 11  views and triggers exported to other systems (more with MySQL and PostgreSQL: they must do the same there)
+php tests/f17_rutinas_importadas.php → OK: 9 views and triggers imported from MySQL, PostgreSQL and SQL Server (more with the servers)
+php tests/f18_access.php       → OK: 10    Microsoft Access: import and export (more with PowerShell: the script)
+php tests/f19_escrituras_contra_sqlite.php → OK: 19  random writes and queries on tables of many parts, against SQLite
+php tests/f20_memoria.php      → OK: 32    the panel with 32 MB: export, import and backups of a larger database (also --directa)
+php tests/f21_compatibilidad.php → OK: 132 SQLite and MySQL syntax and functions, windows, recursion, COLLATE, against SQLite
+php tests/f22_sqlserver.php    → OK: 4     SQL Server's script and import (more with PowerShell)
+php tests/f23_reparar.php      → OK: 29    hand-broken JSON files repaired, or set aside; indexes checked against the rows
+php tests/f24_versiones_anteriores.php → OK: 28  every published version's database opened by this one (needs the git tags)
+php tests/f25_ficheros_abiertos.php → OK: 5  files another process holds open while a write replaces them (Windows; the CI runs it there too)
+```
+
+The CI runs them all with PHP 8.0 to 8.5 on Linux; on Windows, `f25` and the
+engine's suites (`f1`, `f2_parser`, `f2_select`, `f3`, `f8`, `f9`, `f10` and
+`f23`, 2.10); and PHPStan.
+
+`f5_admin.php` needs the cURL extension and starts two PHP built-in servers,
+one for the panel and one for the API, because the built-in server handles one
+request at a time and the panel calls the API from inside its own request.
+
+`php tests/benchmark.php [rows]` measures the engine on a generated dataset
+(mean of several repetitions of each query) so you can repeat the numbers
+quoted in the documentation on your own machine;
+`php tests/benchmark_concurrencia.php` measures readers and writers on one
+table in real processes.
