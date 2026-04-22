@@ -1,0 +1,155 @@
+<?php
+// ============================================================
+// PLANTILLA. Copia este fichero a config.php. ADMIN_API_KEY y ADMIN_HMAC_SECRET
+// son la 'key' y el 'hmac_secret' de la cuenta admin en
+// api/jsonsqldb_api_config.php.
+// ============================================================
+// ============================================================
+// jsonSQLDBadmin - Configuración del panel
+// Este fichero NO debe ser accesible desde el navegador.
+// El .htaccess / web.config de esta carpeta ya lo bloquea.
+//
+// https://miguelenred.es/jsonsqldb
+// ============================================================
+
+// ------------------------------------------------------------
+// CONEXIÓN CON EL MOTOR
+// ------------------------------------------------------------
+// 'api'      por la API firmada con HMAC (api/jsonsqldb_api.php), en esta
+//            máquina o en otra. Es la opción por defecto.
+// 'directa'  el panel carga el motor y le habla sin HTTP. Solo si el panel y
+//            los datos están en la misma máquina; no necesita claves, y cada
+//            consulta se ahorra una petición HTTP. Los permisos de cada usuario
+//            del panel los aplica el motor igual que con una API key.
+//
+// El asistente del primer arranque escribe esto por ti.
+defined('ADMIN_CONEXION') || define('ADMIN_CONEXION', 'api');
+
+// Solo para la conexión directa: carpeta de jsonSQLDB, la que contiene
+// engine/ y config.php. Vacía = la carpeta padre de este panel, que es donde
+// está en la instalación normal.
+defined('ADMIN_MOTOR_RUTA') || define('ADMIN_MOTOR_RUTA', '');
+
+// --- Solo para la conexión por API ---
+// URL de la API. Vacía = se calcula sola (../api/jsonsqldb_api.php).
+defined('ADMIN_API_URL') || define('ADMIN_API_URL', (string)getenv('ADMIN_API_URL'));
+
+// Clave de administración creada en api/jsonsqldb_api_config.php.
+// Cámbiala allí y aquí a la vez.
+defined('ADMIN_API_KEY') || define('ADMIN_API_KEY', 'CHANGE_ME_ADMIN_API_KEY');
+
+// El 'hmac_secret' de esa misma cuenta en api/jsonsqldb_api_config.php.
+defined('ADMIN_HMAC_SECRET') || define('ADMIN_HMAC_SECRET', 'CHANGE_ME_ADMIN_SECRET');
+
+// --- Certificado del servidor de la API ---
+// Si la API va por HTTPS con un certificado propio (autofirmado o de una CA
+// interna), tienes dos formas de que el panel lo acepte:
+//
+//  1. RECOMENDADA: indica aquí la ruta del .crt / .pem del certificado o de la
+//     CA que lo firma. Se sigue verificando, pero contra ese fichero.
+//     El nombre del servidor de ADMIN_API_URL tiene que coincidir con el del
+//     certificado (si el certificado es para 'midominio', usa https://midominio:...).
+//     Ejemplo Windows: 'C:/xampp/apache/conf/ssl.crt/server.crt'
+//     Ejemplo Linux:   '/etc/ssl/certs/mi-ca.crt'
+defined('ADMIN_SSL_CA') || define('ADMIN_SSL_CA', (string)getenv('ADMIN_SSL_CA'));
+
+//  2. ATAJO: aceptar el certificado sin comprobarlo. Vale para una red interna
+//     de confianza, pero deja de protegerte frente a un intermediario.
+//     Solo se aplica si ADMIN_SSL_CA está vacío.
+defined('ADMIN_SSL_AUTOFIRMADO') || define('ADMIN_SSL_AUTOFIRMADO', false);
+
+// Segundos de espera de cada llamada a la API.
+defined('ADMIN_TIMEOUT') || define('ADMIN_TIMEOUT', 300);
+
+// ------------------------------------------------------------
+// DATOS DEL PROPIO PANEL (usuarios y auditoría, en JSON; y en sus
+// subcarpetas copias/ las copias programadas e importar/ los ficheros para
+// importar). PHP tiene que poder escribir en ella.
+// ------------------------------------------------------------
+defined('ADMIN_DATA_PATH') || define('ADMIN_DATA_PATH',
+    (string)(getenv('ADMIN_DATA_PATH') ?: __DIR__ . '/datos'));
+
+// Clave de la API para los usuarios con rol de solo lectura. OPCIONAL.
+//
+// Si la pones, el panel firma con ella cuando quien ha entrado no es admin, y el
+// motor rechaza cualquier escritura aunque el panel se equivoque. Créala en
+// api/jsonsqldb_api_config.php con 'permiso' => 'lectura'.
+//
+// Vacía = todos los usuarios usan la clave admin y la única barrera es la
+// comprobación del propio panel.
+defined('ADMIN_API_KEY_LECTURA') || define('ADMIN_API_KEY_LECTURA', '');
+defined('ADMIN_HMAC_SECRET_LECTURA') || define('ADMIN_HMAC_SECRET_LECTURA', '');
+
+// ------------------------------------------------------------
+// QUIÉN PUEDE ABRIR EL PANEL
+// ------------------------------------------------------------
+// IPs que pueden entrar. Vacío = cualquiera.
+// Admite IP suelta ('10.0.0.7') y rango CIDR ('192.168.1.0/24').
+// Si el panel solo lo usas tú desde la oficina o por VPN, esto vale más que
+// cualquier otra medida: quien no esté en la lista ni siquiera ve el login.
+defined('ADMIN_IPS_PERMITIDAS') || define('ADMIN_IPS_PERMITIDAS', []);
+
+// Exigir HTTPS para entrar al panel. En producción, a true: por aquí viajan
+// contraseñas y datos.
+defined('ADMIN_EXIGIR_HTTPS') || define('ADMIN_EXIGIR_HTTPS', true);
+
+// Confiar en X-Forwarded-For y X-Forwarded-Proto. Solo si delante hay un proxy
+// o balanceador de confianza; si no, cualquiera puede falsear su IP. Se toma
+// la última IP de X-Forwarded-For, la que añade el proxy.
+defined('ADMIN_CONFIAR_EN_PROXY') || define('ADMIN_CONFIAR_EN_PROXY', false);
+
+// ------------------------------------------------------------
+// SESIÓN Y ACCESO
+// ------------------------------------------------------------
+defined('ADMIN_SESION_NOMBRE')  || define('ADMIN_SESION_NOMBRE', 'jsonsqldbadmin');
+defined('ADMIN_SESION_MINUTOS') || define('ADMIN_SESION_MINUTOS', 60);   // inactividad máxima
+
+// Bloqueo tras varios intentos de acceso fallidos, por IP. Los fallos se
+// olvidan ADMIN_LOGIN_BLOQUEO_MIN minutos después del último.
+defined('ADMIN_LOGIN_MAX_FALLOS')  || define('ADMIN_LOGIN_MAX_FALLOS', 5);
+defined('ADMIN_LOGIN_BLOQUEO_MIN') || define('ADMIN_LOGIN_BLOQUEO_MIN', 15);
+
+// Coste del bcrypt de las contraseñas (10-12 es lo razonable).
+defined('ADMIN_BCRYPT_COSTE') || define('ADMIN_BCRYPT_COSTE', 11);
+
+// ------------------------------------------------------------
+// AUDITORÍA
+// ------------------------------------------------------------
+// Días que se conservan los ficheros de auditoría. 0 = para siempre.
+defined('ADMIN_AUDIT_DIAS') || define('ADMIN_AUDIT_DIAS', 90);
+
+// ------------------------------------------------------------
+// INTERFAZ
+// ------------------------------------------------------------
+// Filas por página al navegar por los datos de una tabla.
+defined('ADMIN_FILAS_PAGINA') || define('ADMIN_FILAS_PAGINA', 50);
+
+// Caracteres máximos de una celda antes de recortarla en el listado.
+defined('ADMIN_CELDA_MAX') || define('ADMIN_CELDA_MAX', 120);
+
+// ------------------------------------------------------------
+// EXPORTACIÓN
+// ------------------------------------------------------------
+// Separador del CSV. El Excel en español espera ';'; usa ',' si vas a abrir
+// el fichero con otras herramientas.
+defined('ADMIN_CSV_SEPARADOR') || define('ADMIN_CSV_SEPARADOR', ';');
+
+// Las exportaciones no tienen tope de filas: si no caben en la memoria de PHP
+// se piden por lotes (2.8). ADMIN_EXPORT_MAX ya no se usa; si sigue en tu
+// config.php de una versión anterior, no molesta y lo puedes borrar.
+
+// Copia en ZIP: ruta de la carpeta 'data' del motor, la que contiene una
+// subcarpeta por base de datos.
+//
+// Es lo ÚNICO con lo que el panel toca los ficheros del motor directamente: la
+// copia en ZIP los lee tal cual están en disco (la API devuelve datos, no
+// ficheros), restaurar un ZIP los escribe, y las importaciones van en una
+// transacción del motor sobre esta carpeta, para deshacerlas enteras si algo
+// falla. Si el panel está en
+// otra máquina, déjalo vacío: la copia y la restauración en ZIP quedan
+// desactivadas, las importaciones no se deshacen enteras si fallan a medias y
+// el volcado en SQL sigue funcionando.
+//
+// Vacío = se busca en ../data, que es donde está en la instalación normal.
+defined('ADMIN_RUTA_DATOS_MOTOR') || define('ADMIN_RUTA_DATOS_MOTOR',
+    (string)getenv('ADMIN_RUTA_DATOS_MOTOR'));
